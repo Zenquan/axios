@@ -12,6 +12,12 @@ var server, proxy;
 var AxiosError = require('../../../lib/core/AxiosError');
 var FormData = require('form-data');
 var formidable = require('formidable');
+var express = require('express');
+var multer = require('multer');
+var bodyParser = require('body-parser');
+const isBlobSupported = typeof Blob !== 'undefined';
+
+var noop = ()=> {};
 
 describe('supports http with nodejs', function () {
 
@@ -140,7 +146,7 @@ describe('supports http with nodejs', function () {
         assert.strictEqual(success, false, 'request should not succeed');
         assert.strictEqual(failure, true, 'request should fail');
         assert.strictEqual(error.code, 'ECONNABORTED');
-        assert.strictEqual(error.message, 'timeout of 250ms exceeded');
+        assert.strictEqual(error.message, 'oops, timeout');
         done();
       }, 300);
     });
@@ -202,7 +208,7 @@ describe('supports http with nodejs', function () {
         assert.equal(res.data, str);
         assert.equal(res.request.path, '/two');
         done();
-      }).catch(done);;
+      }).catch(done);
     });
   });
 
@@ -221,7 +227,7 @@ describe('supports http with nodejs', function () {
         assert.equal(res.status, 302);
         assert.equal(res.headers['location'], '/foo');
         done();
-      }).catch(done);;
+      }).catch(done);
     });
   });
 
@@ -239,7 +245,7 @@ describe('supports http with nodejs', function () {
         assert.equal(error.code, AxiosError.ERR_FR_TOO_MANY_REDIRECTS);
         assert.equal(error.message, 'Maximum number of redirects exceeded');
         done();
-      });
+      }).catch(done);
     });
   });
 
@@ -261,6 +267,56 @@ describe('supports http with nodejs', function () {
       }).catch(function (error) {
         assert.equal(error.message, 'Provided path is not allowed');
         done();
+      }).catch(done);
+    });
+  });
+
+  it('should support beforeRedirect and proxy with redirect', function (done) {
+    var requestCount = 0;
+    var totalRedirectCount = 5;
+    server = http.createServer(function (req, res) {
+      requestCount += 1;
+      if (requestCount <= totalRedirectCount) {
+        res.setHeader('Location', 'http://localhost:4444');
+        res.writeHead(302);
+      }
+      res.end();
+    }).listen(4444, function () {
+      var proxyUseCount = 0;
+      proxy = http.createServer(function (request, response) {
+        proxyUseCount += 1;
+        var parsed = url.parse(request.url);
+        var opts = {
+          host: parsed.hostname,
+          port: parsed.port,
+          path: parsed.path
+        };
+
+        http.get(opts, function (res) {
+          response.writeHead(res.statusCode, res.headers);
+          res.on('data', function (data) {
+            response.write(data)
+          });
+          res.on('end', function () {
+            response.end();
+          });
+        });
+      }).listen(4000, function () {
+        var configBeforeRedirectCount = 0;
+        axios.get('http://localhost:4444/', {
+          proxy: {
+            host: 'localhost',
+            port: 4000
+          },
+          maxRedirects: totalRedirectCount,
+          beforeRedirect: function (options) {
+            configBeforeRedirectCount += 1;
+          }
+        }).then(function (res) {
+          assert.equal(totalRedirectCount, configBeforeRedirectCount, 'should invoke config.beforeRedirect option on every redirect');
+          assert.equal(totalRedirectCount + 1, proxyUseCount, 'should go through proxy on every redirect');
+          done();
+        }).catch(done);
       });
     });
   });
@@ -513,6 +569,32 @@ describe('supports http with nodejs', function () {
     });
   });
 
+  it('should properly support default max body length (follow-redirects as well)', function (done) {
+    // taken from https://github.com/follow-redirects/follow-redirects/blob/22e81fc37132941fb83939d1dc4c2282b5c69521/index.js#L461
+    var followRedirectsMaxBodyDefaults = 10 * 1024 *1024;
+    var data = Array(2 * followRedirectsMaxBodyDefaults).join('ж');
+
+    server = http.createServer(function (req, res) {
+      // consume the req stream
+      req.on('data', noop);
+      // and wait for the end before responding, otherwise an ECONNRESET error will be thrown
+      req.on('end', ()=> {
+        res.end('OK');
+      });
+    }).listen(4444, function (err) {
+      if (err) {
+        return done(err);
+      }
+      // send using the default -1 (unlimited axios maxBodyLength)
+      axios.post('http://localhost:4444/', {
+        data: data
+      }).then(function (res) {
+        assert.equal(res.data, 'OK', 'should handle response');
+        done();
+      }).catch(done);
+    });
+  });
+
   it('should display error while parsing params', function (done) {
     server = http.createServer(function () {
 
@@ -687,7 +769,7 @@ describe('supports http with nodejs', function () {
           proxy: {
             host: 'localhost',
             port: 4000,
-            protocol: 'https'
+            protocol: 'https:'
           },
           httpsAgent: new https.Agent({
             rejectUnauthorized: false
@@ -792,6 +874,56 @@ describe('supports http with nodejs', function () {
           })
         }).then(function (res) {
           assert.equal(res.data, '123456789', 'should pass through proxy');
+          done();
+        }).catch(done);
+      });
+    });
+  });
+
+  it('should re-evaluate proxy on redirect when proxy set via env var', function (done) {
+    process.env.http_proxy = 'http://localhost:4000'
+    process.env.no_proxy = 'localhost:4000'
+
+    var proxyUseCount = 0;
+
+    server = http.createServer(function (req, res) {
+      res.setHeader('Location', 'http://localhost:4000/redirected');
+      res.statusCode = 302;
+      res.end();
+    }).listen(4444, function () {
+      proxy = http.createServer(function (request, response) {
+        var parsed = url.parse(request.url);
+        if (parsed.pathname === '/redirected') {
+          response.statusCode = 200;
+          response.end();
+          return;
+        }
+
+        proxyUseCount += 1;
+
+        var opts = {
+          host: parsed.hostname,
+          port: parsed.port,
+          path: parsed.path,
+          protocol: parsed.protocol,
+          rejectUnauthorized: false
+        };
+
+        http.get(opts, function (res) {
+          var body = '';
+          res.on('data', function (data) {
+            body += data;
+          });
+          res.on('end', function () {
+            response.setHeader('Content-Type', 'text/html; charset=UTF-8');
+            response.setHeader('Location', res.headers.location);
+            response.end(body);
+          });
+        });
+      }).listen(4000, function () {
+        axios.get('http://localhost:4444/').then(function(res) {
+          assert.equal(res.status, 200);
+          assert.equal(proxyUseCount, 1);
           done();
         }).catch(done);
       });
@@ -1166,43 +1298,237 @@ describe('supports http with nodejs', function () {
     });
   });
 
-  it('should allow passing FormData', function (done) {
-    var form = new FormData();
-    var file1= Buffer.from('foo', 'utf8');
+  it('should able to cancel multiple requests with CancelToken', function(done){
+    server = http.createServer(function (req, res) {
+      res.end('ok');
+    }).listen(4444, function () {
+      var CancelToken = axios.CancelToken;
+      var source = CancelToken.source();
+      var canceledStack = [];
 
-    form.append('foo', "bar");
-    form.append('file1', file1, {
-      filename: 'bar.jpg',
-      filepath: 'temp/bar.jpg',
-      contentType: 'image/jpeg'
+      var requests = [1, 2, 3, 4, 5].map(function(id){
+        return axios
+          .get('/foo/bar', { cancelToken: source.token })
+          .catch(function (e) {
+            if (!axios.isCancel(e)) {
+              throw e;
+            }
+
+            canceledStack.push(id);
+          });
+      });
+
+      source.cancel("Aborted by user");
+
+      Promise.all(requests).then(function () {
+        assert.deepStrictEqual(canceledStack.sort(), [1, 2, 3, 4, 5])
+      }).then(done, done);
+    });
+  });
+
+  describe('FormData', function () {
+    it('should allow passing FormData', function (done) {
+      var form = new FormData();
+      var file1 = Buffer.from('foo', 'utf8');
+
+      form.append('foo', "bar");
+      form.append('file1', file1, {
+        filename: 'bar.jpg',
+        filepath: 'temp/bar.jpg',
+        contentType: 'image/jpeg'
+      });
+
+      server = http.createServer(function (req, res) {
+        var receivedForm = new formidable.IncomingForm();
+
+        receivedForm.parse(req, function (err, fields, files) {
+          if (err) {
+            return done(err);
+          }
+
+          res.end(JSON.stringify({
+            fields: fields,
+            files: files
+          }));
+        });
+      }).listen(4444, function () {
+        axios.post('http://localhost:4444/', form, {
+          headers: {
+            'Content-Type': 'multipart/form-data'
+          }
+        }).then(function (res) {
+          assert.deepStrictEqual(res.data.fields, {foo: 'bar'});
+
+          assert.strictEqual(res.data.files.file1.mimetype, 'image/jpeg');
+          assert.strictEqual(res.data.files.file1.originalFilename, 'temp/bar.jpg');
+          assert.strictEqual(res.data.files.file1.size, 3);
+
+          done();
+        }).catch(done);
+      });
     });
 
-    server = http.createServer(function (req, res) {
-      var receivedForm = new formidable.IncomingForm();
+    describe('toFormData helper', function () {
+      it('should properly serialize nested objects for parsing with multer.js (express.js)', function (done) {
+        var app = express();
 
-      receivedForm.parse(req, function (err, fields, files) {
-        if (err) {
-          return done(err);
-        }
+        var obj = {
+          arr1: ['1', '2', '3'],
+          arr2: ['1', ['2'], '3'],
+          obj: {x: '1', y: {z: '1'}},
+          users: [{name: 'Peter', surname: 'griffin'}, {name: 'Thomas', surname: 'Anderson'}]
+        };
 
-        res.end(JSON.stringify({
-          fields: fields,
-          files: files
-        }));
+        app.post('/', multer().none(), function (req, res, next) {
+          res.send(JSON.stringify(req.body));
+        });
+
+        server = app.listen(3001, function () {
+          // multer can parse the following key/value pairs to an array (indexes: null, false, true):
+          // arr: '1'
+          // arr: '2'
+          // -------------
+          // arr[]: '1'
+          // arr[]: '2'
+          // -------------
+          // arr[0]: '1'
+          // arr[1]: '2'
+          // -------------
+          Promise.all([null, false, true].map(function (mode) {
+            return axios.postForm('http://localhost:3001/', obj, {formSerializer: {indexes: mode}})
+              .then(function (res) {
+                assert.deepStrictEqual(res.data, obj, 'Index mode ' + mode);
+              });
+          })).then(function (){
+            done();
+          }, done)
+        });
       });
-    }).listen(4444, function () {
-      axios.post('http://localhost:4444/', form, {
+    });
+  });
+
+  describe('URLEncoded Form', function () {
+    it('should post object data as url-encoded form if content-type is application/x-www-form-urlencoded', function (done) {
+      var app = express();
+
+      var obj = {
+        arr1: ['1', '2', '3'],
+        arr2: ['1', ['2'], '3'],
+        obj: {x: '1', y: {z: '1'}},
+        users: [{name: 'Peter', surname: 'griffin'}, {name: 'Thomas', surname: 'Anderson'}]
+      };
+
+      app.use(bodyParser.urlencoded({ extended: true }));
+
+      app.post('/', function (req, res, next) {
+        res.send(JSON.stringify(req.body));
+      });
+
+      server = app.listen(3001, function () {
+        return axios.post('http://localhost:3001/', obj, {
+          headers: {
+            'content-type': 'application/x-www-form-urlencoded'
+          }
+        })
+          .then(function (res) {
+            assert.deepStrictEqual(res.data, obj);
+            done();
+          }).catch(done);
+      });
+    });
+  });
+
+  it('should respect formSerializer config', function (done) {
+    const obj = {
+      arr1: ['1', '2', '3'],
+      arr2: ['1', ['2'], '3'],
+    };
+
+    const form = new URLSearchParams();
+
+    form.append('arr1[0]', '1');
+    form.append('arr1[1]', '2');
+    form.append('arr1[2]', '3');
+
+    form.append('arr2[0]', '1');
+    form.append('arr2[1][0]', '2');
+    form.append('arr2[2]', '3');
+
+    server = http.createServer(function (req, res) {
+      req.pipe(res);
+    }).listen(3001, () => {
+      return axios.post('http://localhost:3001/', obj, {
         headers: {
-          'Content-Type': 'multipart/form-data'
+          'content-type': 'application/x-www-form-urlencoded'
+        },
+        formSerializer: {
+          indexes: true
         }
-      }).then(function (res) {
-        assert.deepStrictEqual(res.data.fields,{foo: 'bar'});
+      })
+        .then(function (res) {
+          assert.strictEqual(res.data, form.toString());
+          done();
+        }).catch(done);
+    });
+  });
 
-        assert.strictEqual(res.data.files.file1.mimetype,'image/jpeg');
-        assert.strictEqual(res.data.files.file1.originalFilename,'temp/bar.jpg');
-        assert.strictEqual(res.data.files.file1.size,3);
+  describe('Data URL', function () {
+    it('should support requesting data URL as a Buffer', function (done) {
+      const buffer = Buffer.from('123');
 
+      const dataURI = 'data:application/octet-stream;base64,' + buffer.toString('base64');
+
+      axios.get(dataURI).then(({data})=> {
+        assert.deepStrictEqual(data, buffer);
         done();
+      }).catch(done);
+    });
+
+    it('should support requesting data URL as a Blob (if supported by the environment)', function (done) {
+
+      if (!isBlobSupported) {
+        this.skip();
+        return;
+      }
+
+      const buffer = Buffer.from('123');
+
+      const dataURI = 'data:application/octet-stream;base64,' + buffer.toString('base64');
+
+      axios.get(dataURI, {responseType: 'blob'}).then(async ({data})=> {
+        assert.strictEqual(data.type, 'application/octet-stream');
+        assert.deepStrictEqual(await data.text(), '123');
+        done();
+      }).catch(done);
+    });
+
+    it('should support requesting data URL as a String (text)', function (done) {
+      const buffer = Buffer.from('123', 'utf-8');
+
+      const dataURI = 'data:application/octet-stream;base64,' + buffer.toString('base64');
+
+      axios.get(dataURI, {responseType: "text"}).then(({data})=> {
+        assert.deepStrictEqual(data, '123');
+        done();
+      }).catch(done);
+    });
+
+    it('should support requesting data URL as a Stream', function (done) {
+      const buffer = Buffer.from('123', 'utf-8');
+
+      const dataURI = 'data:application/octet-stream;base64,' + buffer.toString('base64');
+
+      axios.get(dataURI, {responseType: "stream"}).then(({data})=> {
+        var str = '';
+
+        data.on('data', function(response){
+          str += response.toString();
+        });
+
+        data.on('end', function(){
+          assert.strictEqual(str, '123');
+          done();
+        });
       }).catch(done);
     });
   });
